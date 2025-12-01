@@ -100,11 +100,10 @@ async fn request_sol_airdrop(ctx: &ScillaContext) -> anyhow::Result<()> {
             );
         }
         Err(err) => {
-            let err_msg = format!("{}", err);
             eprintln!(
                 "{} {}",
                 style("Airdrop failed:").red().bold(),
-                style(err_msg).red()
+                style(&err).red()
             );
             return Err(err.into());
         }
@@ -138,12 +137,6 @@ async fn fetch_account_balance(ctx: &ScillaContext, pubkey: &Pubkey) -> anyhow::
     Ok(())
 }
 
-
-/// Returns an error if:
-/// - Destination is the same as sender (self-transfer)
-/// - Amount is zero or negative
-/// - Amount exceeds maximum supported value (u64::MAX lamports)
-/// - Amount is too small (less than 1 lamport)
 fn validate_transfer_params(
     sender: &Pubkey,
     destination: &Pubkey,
@@ -178,6 +171,9 @@ fn validate_transfer_params(
     Ok(lamports)
 }
 
+/// Validate balance is sufficient for transfer
+///
+/// # Errors
 /// Returns an error if balance is insufficient to cover transfer amount plus fees
 fn validate_balance(
     balance_lamports: u64,
@@ -196,8 +192,7 @@ fn validate_balance(
     Ok(())
 }
 
-
-
+/// # Errors
 /// Returns an error if:
 /// - RPC connection fails
 /// - Failed to get recent blockhash
@@ -224,59 +219,37 @@ async fn build_transfer_transaction(
     Ok(transaction)
 }
 
-async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
+
+/// # Errors
+/// Returns an error if:
+/// - Transaction simulation fails
+/// - RPC connection fails
+/// - Balance is insufficient
+async fn simulate_and_validate_transfer(
+    ctx: &ScillaContext,
+    destination: &Pubkey,
+    lamports: u64,
+) -> anyhow::Result<(u64, u64)> {
     use anyhow::Context;
-    use inquire::Confirm;
-
-    let destination: Pubkey = prompt_data("Enter destination address:")
-        .context("Failed to parse destination address. Please enter a valid Solana pubkey.")?;
-
-    let amount_sol: f64 = prompt_data("Enter amount in SOL:")
-        .context("Failed to parse amount. Please enter a valid number.")?;
-
-    let lamports = validate_transfer_params(ctx.pubkey(), &destination, amount_sol)?;
 
     println!("\n{}", style("━".repeat(60)).dim());
     println!("{}", style("Simulating transaction...").dim());
 
-    let test_transaction = build_transfer_transaction(ctx, &destination, lamports).await?;
+    let test_transaction = build_transfer_transaction(ctx, destination, lamports).await?;
 
     let simulation_result = ctx
         .rpc()
         .simulate_transaction(&test_transaction)
         .await
-        .context("Failed to simulate transaction")?;
+        .context("Failed to simulate transaction. Check your RPC connection.")?;
 
     const FALLBACK_FEE_LAMPORTS: u64 = 5_000;
     let actual_fee_lamports = simulation_result.value.fee.unwrap_or(FALLBACK_FEE_LAMPORTS);
-    let actual_fee_sol = lamports_to_sol(actual_fee_lamports);
 
     if let Some(err) = &simulation_result.value.err {
         return Err(anyhow::anyhow!(
-            "Transaction simulation failed: {:?}",
-            err
+            "Transaction simulation failed: {err:?}"
         ));
-    }
-
-    // Check logs for critical error patterns (more specific than just "Error")
-    if let Some(logs) = &simulation_result.value.logs {
-        let critical_errors: Vec<String> = logs
-            .iter()
-            .filter(|log| {
-                log.contains("Error:") || 
-                log.contains("failed") || 
-                log.contains("insufficient") ||
-                log.contains("invalid")
-            })
-            .map(|s| s.clone())
-            .collect();
-        
-        if !critical_errors.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Transaction simulation detected errors:\n{}",
-                critical_errors.join("\n")
-            ));
-        }
     }
 
     let current_balance = ctx
@@ -285,7 +258,21 @@ async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
         .await
         .context("Failed to fetch current balance. Check your RPC connection.")?;
 
-    validate_balance(current_balance, lamports, actual_fee_lamports)?;
+    validate_balance(current_balance, lamports, actual_fee_lamports)
+        .context("Initial balance check failed. Insufficient funds for this transfer.")?;
+
+    Ok((current_balance, actual_fee_lamports))
+}
+
+fn display_transfer_confirmation(
+    ctx: &ScillaContext,
+    destination: &Pubkey,
+    amount_sol: f64,
+    lamports: u64,
+    current_balance: u64,
+    actual_fee_lamports: u64,
+) {
+    let actual_fee_sol = lamports_to_sol(actual_fee_lamports);
 
     println!("\n{}", style("━".repeat(60)).dim());
     println!("{}", style("Transfer Confirmation").bold().cyan());
@@ -298,7 +285,7 @@ async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
     println!(
         "{:<12} {}",
         style("To:").bold(),
-        style(&destination).cyan()
+        style(destination).cyan()
     );
     println!(
         "{:<12} {} SOL ({} lamports)",
@@ -322,19 +309,43 @@ async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
         style(lamports_to_sol(current_balance.saturating_sub(lamports).saturating_sub(actual_fee_lamports))).cyan()
     );
     println!("{}\n", style("━".repeat(60)).dim());
+}
 
-    let confirmed = Confirm::new("Confirm transfer?")
-        .with_default(false)
-        .prompt()?;
 
-    if !confirmed {
-        println!("{}", style("Transfer cancelled").yellow());
-        return Ok(());
-    }
+/// # Errors
+/// Returns an error if:
+/// - Balance changed since confirmation
+/// - RPC connection fails
+/// - Transaction send fails
+async fn execute_transfer(
+    ctx: &ScillaContext,
+    destination: &Pubkey,
+    lamports: u64,
+    amount_sol: f64,
+    actual_fee_lamports: u64,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    println!("{}", style("Verifying balance...").dim());
+    let final_balance = ctx
+        .rpc()
+        .get_balance(ctx.pubkey())
+        .await
+        .context("Failed to fetch current balance before sending. Check your RPC connection.")?;
+    
+    validate_balance(final_balance, lamports, actual_fee_lamports)
+        .with_context(|| {
+            format!(
+                "Balance insufficient. Current balance: {} SOL, Required: {} SOL (including {} SOL fee). Balance may have changed since confirmation.",
+                lamports_to_sol(final_balance),
+                lamports_to_sol(lamports.saturating_add(actual_fee_lamports)),
+                lamports_to_sol(actual_fee_lamports)
+            )
+        })?;
 
     println!("{}", style("Sending transaction...").dim());
 
-    let transaction = build_transfer_transaction(ctx, &destination, lamports).await?;
+    let transaction = build_transfer_transaction(ctx, destination, lamports).await?;
 
     let signature = ctx
         .rpc()
@@ -342,8 +353,8 @@ async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
         .await
         .with_context(|| {
             format!(
-                "Transaction failed. Transfer of {} SOL from {} to {} could not be completed.",
-                amount_sol, ctx.pubkey(), destination
+                "Transaction failed. Transfer of {amount_sol} SOL from {} to {} could not be completed. Please check your balance and try again.",
+                ctx.pubkey(), destination
             )
         })?;
     
@@ -372,6 +383,51 @@ async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
         style("New Balance:").bold(),
         style(format!("{:.9}", lamports_to_sol(new_balance))).green()
     );
+
+    Ok(())
+}
+
+/// # Errors
+/// Returns an error if:
+/// - Invalid destination address or amount
+/// - Insufficient balance (checked twice to prevent race conditions)
+/// - Transaction simulation fails
+/// - RPC connection fails
+/// - Transaction send fails
+async fn transfer_sol(ctx: &ScillaContext) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use inquire::Confirm;
+
+    let destination: Pubkey = prompt_data("Enter destination address:")
+        .context("Failed to parse destination address. Please enter a valid Solana pubkey.")?;
+
+    let amount_sol: f64 = prompt_data("Enter amount in SOL:")
+        .context("Failed to parse amount. Please enter a valid number.")?;
+
+    let lamports = validate_transfer_params(ctx.pubkey(), &destination, amount_sol)?;
+
+    let (current_balance, actual_fee_lamports) =
+        simulate_and_validate_transfer(ctx, &destination, lamports).await?;
+
+    display_transfer_confirmation(
+        ctx,
+        &destination,
+        amount_sol,
+        lamports,
+        current_balance,
+        actual_fee_lamports,
+    );
+
+    let confirmed = Confirm::new("Confirm transfer?")
+        .with_default(false)
+        .prompt()?;
+
+    if !confirmed {
+        println!("{}", style("Transfer cancelled").yellow());
+        return Ok(());
+    }
+
+    execute_transfer(ctx, &destination, lamports, amount_sol, actual_fee_lamports).await?;
 
     Ok(())
 }
@@ -474,7 +530,6 @@ mod tests {
 
     #[test]
     fn test_network_cluster_edge_cases() {
-        // Test edge cases for network detection
         assert_eq!(
             get_network_cluster("https://my-custom-rpc.com/mainnet-beta/path"),
             "?cluster=custom" // Hostname is my-custom-rpc.com, not mainnet-beta
@@ -482,7 +537,7 @@ mod tests {
 
         assert_eq!(
             get_network_cluster("https://api.devnet.solana.com:8080"),
-            "?cluster=devnet" // Should strip port before checking
+            "?cluster=devnet"
         );
 
         assert_eq!(
@@ -508,7 +563,7 @@ mod tests {
 
         let result = validate_transfer_params(&sender, &recipient, amount);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 1_500_000_000); // 1.5 SOL in lamports
+        assert_eq!(result.unwrap(), 1_500_000_000);
     }
 
     #[test]
